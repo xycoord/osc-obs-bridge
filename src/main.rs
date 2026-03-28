@@ -51,20 +51,13 @@ fn main() -> Result<()> {
 
     info!("osc-obs-bridge starting");
     info!("Config loaded from: {}", config_path.display());
-    info!(
-        "OBS: {}:{} | OSC listen: {}:{} | OSC send: {}:{}",
-        config.obs_host,
-        config.obs_port,
-        config.osc_listen_host,
-        config.osc_listen_port,
-        config.osc_send_host,
-        config.osc_send_port,
-    );
+    log_config(&config);
 
-    // Channels
-    let (cmd_tx, cmd_rx) = mpsc::channel::<bridge::BridgeCommand>(64);
-    let (resp_tx, resp_rx) = mpsc::channel::<bridge::BridgeResponse>(64);
+    // Status channel (watched by tray icon on main thread)
     let (status_tx, status_rx) = watch::channel(AppStatus::Starting);
+
+    // Reload signal: main thread sends () to tell the runtime to restart tasks
+    let (reload_tx, reload_rx) = mpsc::channel::<()>(1);
 
     // Build the tray icon on the main thread (required by Windows/macOS)
     let icon_green = load_embedded_icon(IconColor::Green);
@@ -73,14 +66,20 @@ fn main() -> Result<()> {
 
     // Menu items
     let status_item = MenuItem::new("osc-obs-bridge: Starting...", false, None);
-    let separator = PredefinedMenuItem::separator();
+    let separator1 = PredefinedMenuItem::separator();
+    let open_config_item = MenuItem::new("Open Config", true, None);
+    let reload_config_item = MenuItem::new("Reload Config", true, None);
     let open_log_item = MenuItem::new("Open Log File", true, None);
+    let separator2 = PredefinedMenuItem::separator();
     let quit_item = MenuItem::new("Quit", true, None);
 
     let menu = Menu::new();
     menu.append(&status_item)?;
-    menu.append(&separator)?;
+    menu.append(&separator1)?;
+    menu.append(&open_config_item)?;
+    menu.append(&reload_config_item)?;
     menu.append(&open_log_item)?;
+    menu.append(&separator2)?;
     menu.append(&quit_item)?;
 
     let tray = TrayIconBuilder::new()
@@ -89,47 +88,32 @@ fn main() -> Result<()> {
         .with_menu(Box::new(menu))
         .build()?;
 
-    // Start the tokio runtime in a background thread
-    let osc_config = config.clone();
-    let obs_config = config.clone();
+    // Start the tokio runtime in a background thread.
+    // It runs a loop: spawn tasks, wait for reload signal or task failure, then restart.
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
+    let runtime_config_path = config_path.clone();
+    let initial_config = config;
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
-            // Spawn OSC task
-            let osc_status_tx = status_tx.clone();
-            let osc_handle = tokio::spawn(async move {
-                if let Err(e) = osc::run(osc_config, cmd_tx, resp_rx, osc_status_tx).await {
-                    error!("OSC task failed: {e}");
-                }
-            });
-
-            // Spawn OBS task
-            let obs_status_tx = status_tx.clone();
-            let obs_handle = tokio::spawn(async move {
-                obs::run(obs_config, cmd_rx, resp_tx, obs_status_tx).await;
-            });
-
-            // Wait for either task to complete (they shouldn't unless there's an error)
-            tokio::select! {
-                r = osc_handle => {
-                    error!("OSC task ended: {r:?}");
-                    running_clone.store(false, Ordering::Relaxed);
-                }
-                r = obs_handle => {
-                    error!("OBS task ended: {r:?}");
-                    running_clone.store(false, Ordering::Relaxed);
-                }
-            }
+            run_bridge_loop(
+                initial_config,
+                runtime_config_path,
+                reload_rx,
+                status_tx,
+                running_clone,
+            )
+            .await;
         });
     });
 
     // Main thread: pump the Win32/GTK event loop and update the tray icon.
-    // We use a simple polling loop since we don't have a full windowing toolkit.
     let menu_rx = muda::MenuEvent::receiver();
     let quit_id = quit_item.id().clone();
     let open_log_id = open_log_item.id().clone();
+    let open_config_id = open_config_item.id().clone();
+    let reload_config_id = reload_config_item.id().clone();
 
     let mut last_status = String::new();
 
@@ -141,6 +125,12 @@ fn main() -> Result<()> {
                 break;
             } else if event.id == open_log_id {
                 let _ = open::that(&log_path);
+            } else if event.id == open_config_id {
+                info!("Opening config file: {}", config_path.display());
+                let _ = open::that(&config_path);
+            } else if event.id == reload_config_id {
+                info!("Reload config requested from tray menu");
+                let _ = reload_tx.try_send(());
             }
         }
 
@@ -173,7 +163,9 @@ fn main() -> Result<()> {
         // On Windows this processes Win32 messages; on Linux it would process GTK events
         #[cfg(target_os = "windows")]
         unsafe {
-            use winapi::um::winuser::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+            use winapi::um::winuser::{
+                DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+            };
             let mut msg: MSG = std::mem::zeroed();
             while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                 TranslateMessage(&msg);
@@ -186,6 +178,89 @@ fn main() -> Result<()> {
 
     info!("osc-obs-bridge shutting down");
     Ok(())
+}
+
+/// The async bridge loop that runs in the tokio runtime thread.
+/// Spawns OSC + OBS tasks, and restarts them when a reload signal is received.
+async fn run_bridge_loop(
+    initial_config: config::Config,
+    config_path: std::path::PathBuf,
+    mut reload_rx: mpsc::Receiver<()>,
+    status_tx: watch::Sender<AppStatus>,
+    running: Arc<AtomicBool>,
+) {
+    let mut current_config = initial_config;
+
+    loop {
+        let _ = status_tx.send(AppStatus::Starting);
+
+        // Create fresh channels for this run
+        let (cmd_tx, cmd_rx) = mpsc::channel::<bridge::BridgeCommand>(64);
+        let (resp_tx, resp_rx) = mpsc::channel::<bridge::BridgeResponse>(64);
+
+        // Spawn tasks
+        let osc_config = current_config.clone();
+        let osc_status_tx = status_tx.clone();
+        let mut osc_handle = tokio::spawn(async move {
+            if let Err(e) = osc::run(osc_config, cmd_tx, resp_rx, osc_status_tx).await {
+                error!("OSC task failed: {e}");
+            }
+        });
+
+        let obs_config = current_config.clone();
+        let obs_status_tx = status_tx.clone();
+        let mut obs_handle = tokio::spawn(async move {
+            obs::run(obs_config, cmd_rx, resp_tx, obs_status_tx).await;
+        });
+
+        // Wait for either: a reload signal, or a task to exit unexpectedly
+        tokio::select! {
+            _ = reload_rx.recv() => {
+                info!("Reload signal received, restarting tasks...");
+            }
+            r = &mut osc_handle => {
+                error!("OSC task ended unexpectedly: {r:?}");
+                running.store(false, Ordering::Relaxed);
+                return;
+            }
+            r = &mut obs_handle => {
+                error!("OBS task ended unexpectedly: {r:?}");
+                running.store(false, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Abort running tasks before restarting
+        osc_handle.abort();
+        obs_handle.abort();
+
+        // Small delay to let sockets close
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Reload config from disk
+        match config::Config::load_or_create(&config_path) {
+            Ok(new_config) => {
+                info!("Config reloaded successfully");
+                log_config(&new_config);
+                current_config = new_config;
+            }
+            Err(e) => {
+                error!("Failed to reload config, keeping current settings: {e}");
+            }
+        }
+    }
+}
+
+fn log_config(config: &config::Config) {
+    info!(
+        "OBS: {}:{} | OSC listen: {}:{} | OSC send: {}:{}",
+        config.obs_host,
+        config.obs_port,
+        config.osc_listen_host,
+        config.osc_listen_port,
+        config.osc_send_host,
+        config.osc_send_port,
+    );
 }
 
 // --- Embedded tray icons (simple colored circles) ---
