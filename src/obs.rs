@@ -130,6 +130,19 @@ async fn connect_and_run(
                             }
                         }
                     }
+                    // Scene list structure changed — push updated list to TouchOSC
+                    Some(obws::events::Event::SceneCreated { id, .. }) => {
+                        info!("OBS scene created: {}", id.name);
+                        push_scene_list(&client, resp_tx).await;
+                    }
+                    Some(obws::events::Event::SceneRemoved { id, .. }) => {
+                        info!("OBS scene removed: {}", id.name);
+                        push_scene_list(&client, resp_tx).await;
+                    }
+                    Some(obws::events::Event::SceneNameChanged { old_name, new_name, .. }) => {
+                        info!("OBS scene renamed: {old_name} -> {new_name}");
+                        push_scene_list(&client, resp_tx).await;
+                    }
                     Some(_) => {
                         // Ignore other events
                     }
@@ -214,6 +227,24 @@ async fn handle_command(
     }
 
     Ok(())
+}
+
+/// Push the current scene list to TouchOSC.
+/// Called when scenes are created, removed, or renamed in OBS.
+async fn push_scene_list(
+    client: &obws::Client,
+    resp_tx: &mpsc::Sender<BridgeResponse>,
+) {
+    match client.scenes().list().await {
+        Ok(scenes) => {
+            let names: Vec<String> = scenes.scenes.iter().map(|s| s.id.name.clone()).collect();
+            info!("Pushing updated scene list: {} scenes", names.len());
+            let _ = resp_tx.send(BridgeResponse::SceneList(names)).await;
+        }
+        Err(e) => {
+            warn!("Failed to fetch scene list for push: {e}");
+        }
+    }
 }
 
 /// Check if an error is likely a connection/disconnect error.
