@@ -1,0 +1,227 @@
+use anyhow::Result;
+use futures_util::StreamExt;
+use tokio::sync::{mpsc, watch};
+use tracing::{error, info, warn};
+
+use crate::bridge::{AppStatus, BridgeCommand, BridgeResponse};
+use crate::config::Config;
+
+/// Run the OBS WebSocket client task.
+///
+/// Connects to OBS, handles commands from the OSC layer, and listens for OBS events.
+/// Automatically reconnects on disconnect.
+pub async fn run(
+    config: Config,
+    mut cmd_rx: mpsc::Receiver<BridgeCommand>,
+    resp_tx: mpsc::Sender<BridgeResponse>,
+    status_tx: watch::Sender<AppStatus>,
+) {
+    loop {
+        info!(
+            "Connecting to OBS at {}:{}...",
+            config.obs_host, config.obs_port
+        );
+
+        match connect_and_run(&config, &mut cmd_rx, &resp_tx, &status_tx).await {
+            Ok(()) => {
+                info!("OBS connection closed cleanly");
+            }
+            Err(e) => {
+                warn!("OBS connection error: {e}");
+            }
+        }
+
+        let _ = status_tx.send(AppStatus::ObsDisconnected);
+        info!("Reconnecting to OBS in 5 seconds...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Fetch the scene list and find the index of a given scene name.
+async fn get_scene_index(
+    client: &obws::Client,
+    scene_name: &str,
+) -> Result<(usize, Vec<String>)> {
+    let scenes = client.scenes().list().await?;
+    let names: Vec<String> = scenes.scenes.iter().map(|s| s.id.name.clone()).collect();
+    let index = names.iter().position(|n| n == scene_name).unwrap_or(0);
+    Ok((index, names))
+}
+
+/// Connect to OBS and process commands/events until disconnection.
+async fn connect_and_run(
+    config: &Config,
+    cmd_rx: &mut mpsc::Receiver<BridgeCommand>,
+    resp_tx: &mpsc::Sender<BridgeResponse>,
+    status_tx: &watch::Sender<AppStatus>,
+) -> Result<()> {
+    let client = obws::Client::connect(
+        &config.obs_host,
+        config.obs_port,
+        Some(&config.obs_password),
+    )
+    .await?;
+
+    let version = client.general().version().await?;
+    info!(
+        "Connected to OBS (WebSocket v{}, RPC v{})",
+        version.obs_web_socket_version, version.rpc_version
+    );
+
+    // Get current scene for status
+    let current = client.scenes().current_program_scene().await?;
+    let _ = status_tx.send(AppStatus::Connected {
+        scene: current.id.name.clone(),
+    });
+
+    // Set up event listener for scene changes.
+    // We use an internal channel because the event stream borrows from client,
+    // and we need to process events in the same task that owns the client.
+    let mut events = client.events()?;
+
+    // Main loop: process commands and events concurrently
+    loop {
+        tokio::select! {
+            // Handle commands from OSC
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(cmd) => {
+                        if let Err(e) = handle_command(&client, cmd, resp_tx, status_tx).await {
+                            error!("Error handling command: {e}");
+                            if is_connection_error(&e) {
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        // Channel closed, shutting down
+                        break;
+                    }
+                }
+            }
+
+            // Handle OBS events
+            event = events.next() => {
+                match event {
+                    Some(obws::events::Event::CurrentProgramSceneChanged { id }) => {
+                        info!("OBS scene changed: {}", id.name);
+                        let _ = status_tx.send(AppStatus::Connected {
+                            scene: id.name.clone(),
+                        });
+
+                        // Look up the index and send /activeSceneReturn
+                        match get_scene_index(&client, &id.name).await {
+                            Ok((index, _names)) => {
+                                let _ = resp_tx
+                                    .send(BridgeResponse::ActiveScene {
+                                        index,
+                                        name: id.name,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("Failed to get scene index: {e}");
+                                let _ = resp_tx
+                                    .send(BridgeResponse::ActiveScene {
+                                        index: 0,
+                                        name: id.name,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        // Ignore other events
+                    }
+                    None => {
+                        // Event stream ended, OBS probably disconnected
+                        warn!("OBS event stream ended");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle a single bridge command by calling the OBS API.
+async fn handle_command(
+    client: &obws::Client,
+    cmd: BridgeCommand,
+    resp_tx: &mpsc::Sender<BridgeResponse>,
+    status_tx: &watch::Sender<AppStatus>,
+) -> Result<()> {
+    match cmd {
+        BridgeCommand::GetSceneList => {
+            let scenes = client.scenes().list().await?;
+            let names: Vec<String> = scenes.scenes.iter().map(|s| s.id.name.clone()).collect();
+            info!("Scene list requested: {} scenes", names.len());
+            resp_tx.send(BridgeResponse::SceneList(names)).await?;
+        }
+
+        BridgeCommand::GetActiveScene => {
+            let current = client.scenes().current_program_scene().await?;
+            let (index, _names) = get_scene_index(client, &current.id.name).await?;
+            info!(
+                "Active scene requested: {} (index {})",
+                current.id.name, index
+            );
+            resp_tx
+                .send(BridgeResponse::ActiveScene {
+                    index,
+                    name: current.id.name,
+                })
+                .await?;
+        }
+
+        BridgeCommand::SetSceneByName(name) => {
+            info!("Switching to scene: {name}");
+            client
+                .scenes()
+                .set_current_program_scene(name.as_str())
+                .await?;
+            // Scene change event will send the /activeSceneReturn automatically
+            let _ = status_tx.send(AppStatus::Connected {
+                scene: name.clone(),
+            });
+        }
+
+        BridgeCommand::SetSceneByIndex(idx) => {
+            let scenes = client.scenes().list().await?;
+            let names: Vec<String> = scenes.scenes.iter().map(|s| s.id.name.clone()).collect();
+            // OSC index is 1-based
+            let zero_idx = (idx - 1).max(0) as usize;
+            if let Some(name) = names.get(zero_idx) {
+                info!("Switching to scene by index {idx}: {name}");
+                client
+                    .scenes()
+                    .set_current_program_scene(name.as_str())
+                    .await?;
+                let _ = status_tx.send(AppStatus::Connected {
+                    scene: name.clone(),
+                });
+            } else {
+                warn!(
+                    "Scene index {idx} out of range (have {} scenes)",
+                    names.len()
+                );
+                // Send back the scene list so TouchOSC can resync
+                resp_tx.send(BridgeResponse::SceneList(names)).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if an error is likely a connection/disconnect error.
+fn is_connection_error(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:?}").to_lowercase();
+    msg.contains("disconnect")
+        || msg.contains("connection")
+        || msg.contains("websocket")
+        || msg.contains("closed")
+        || msg.contains("broken pipe")
+}
