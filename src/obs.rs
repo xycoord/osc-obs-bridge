@@ -1,7 +1,7 @@
 use anyhow::Result;
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::bridge::{AppStatus, BridgeCommand, BridgeResponse};
 use crate::config::Config;
@@ -75,11 +75,15 @@ async fn connect_and_run(
     });
 
     // Set up event listener for scene changes.
-    // We use an internal channel because the event stream borrows from client,
-    // and we need to process events in the same task that owns the client.
     let mut events = client.events()?;
 
-    // Main loop: process commands and events concurrently
+    // Poll timer: check for scene list changes every second.
+    // OBS doesn't fire events for scene reordering, so we poll and diff.
+    let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cached_scene_list: Vec<String> = Vec::new();
+
+    // Main loop: process commands, events, and poll concurrently
     loop {
         tokio::select! {
             // Handle commands from OSC
@@ -147,13 +151,39 @@ async fn connect_and_run(
                         info!("OBS scene list reordered");
                         push_scene_list(&client, resp_tx).await;
                     }
-                    Some(_) => {
-                        // Ignore other events
+                    Some(other) => {
+                        debug!("Ignoring OBS event: {other:?}");
                     }
                     None => {
                         // Event stream ended, OBS probably disconnected
                         warn!("OBS event stream ended");
                         break;
+                    }
+                }
+            }
+
+            // Poll for scene list changes (catches reordering, which OBS has no event for)
+            _ = poll_interval.tick() => {
+                match client.scenes().list().await {
+                    Ok(scenes) => {
+                        let names: Vec<String> =
+                            scenes.scenes.iter().map(|s| s.id.name.clone()).collect();
+                        if names != cached_scene_list {
+                            if !cached_scene_list.is_empty() {
+                                info!("Scene list changed (detected by poll): {} scenes", names.len());
+                                let _ = resp_tx
+                                    .send(BridgeResponse::SceneList(names.clone()))
+                                    .await;
+                            }
+                            cached_scene_list = names;
+                        }
+                    }
+                    Err(e) => {
+                        let ae: anyhow::Error = e.into();
+                        if is_connection_error(&ae) {
+                            warn!("Poll failed (connection error): {ae}");
+                            break;
+                        }
                     }
                 }
             }
