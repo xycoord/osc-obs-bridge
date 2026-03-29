@@ -160,18 +160,7 @@ fn main() -> Result<()> {
         }
 
         // Pump the native event loop at ~30Hz
-        // On Windows this processes Win32 messages; on Linux it would process GTK events
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use winapi::um::winuser::{
-                DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-            };
-            let mut msg: MSG = std::mem::zeroed();
-            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        pump_event_loop();
 
         std::thread::sleep(std::time::Duration::from_millis(33));
     }
@@ -262,6 +251,49 @@ fn log_config(config: &config::Config) {
         config.osc_send_port,
     );
 }
+
+// --- Platform-specific event loop pumping ---
+
+/// Pump the native event loop so the tray icon and menus work.
+#[cfg(target_os = "windows")]
+fn pump_event_loop() {
+    unsafe {
+        use winapi::um::winuser::{
+            DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+        };
+        let mut msg: MSG = std::mem::zeroed();
+        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// On Linux, tray-icon requires a GTK event loop. This is a stub that logs a warning once.
+/// Full Linux support would require the `gtk` crate and `gtk::main_iteration_do(false)`.
+#[cfg(target_os = "linux")]
+fn pump_event_loop() {
+    use std::sync::Once;
+    static WARN: Once = Once::new();
+    WARN.call_once(|| {
+        tracing::warn!("Linux tray icon support requires a GTK event loop — tray icon may not work");
+    });
+}
+
+/// On macOS, tray-icon requires a Cocoa run loop on the main thread.
+/// Full macOS support would require `objc` / `cocoa` crates.
+#[cfg(target_os = "macos")]
+fn pump_event_loop() {
+    use std::sync::Once;
+    static WARN: Once = Once::new();
+    WARN.call_once(|| {
+        tracing::warn!("macOS tray icon support requires a Cocoa run loop — tray icon may not work");
+    });
+}
+
+/// Fallback for other platforms.
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn pump_event_loop() {}
 
 // --- Embedded tray icons (simple colored circles) ---
 

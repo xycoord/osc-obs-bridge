@@ -29,18 +29,20 @@ pub async fn run(
     let _ = status_tx.send(AppStatus::OscListening);
 
     let socket = Arc::new(socket);
-    let default_send_addr: SocketAddr = format!("{}:{}", config.osc_send_host, config.osc_send_port)
+    let send_port = config.osc_send_port;
+    let default_send_addr: SocketAddr = format!("{}:{}", config.osc_send_host, send_port)
         .parse()
         .context("Invalid OSC send address")?;
 
-    // Track the last client address we received a message from.
+    // Track the last client IP we received a message from.
     // This lets us reply to the tablet even if its IP differs from the configured send address.
-    let last_client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    // We store only the IP — responses are always sent to the configured osc_send_port.
+    let last_client_ip: Arc<Mutex<Option<std::net::IpAddr>>> = Arc::new(Mutex::new(None));
 
     // Spawn the outbound sender task
     let send_socket = Arc::clone(&socket);
-    let send_client_addr = Arc::clone(&last_client_addr);
-    tokio::spawn(async move {
+    let send_client_ip = Arc::clone(&last_client_ip);
+    let mut sender_handle = tokio::spawn(async move {
         while let Some(response) = resp_rx.recv().await {
             let packet = response_to_osc(&response);
             let bytes = match rosc::encoder::encode(&packet) {
@@ -56,12 +58,14 @@ pub async fn run(
                 error!("Failed to send OSC to {default_send_addr}: {e}");
             }
 
-            // Also send to the last-known client if it's different from the default
-            let client = send_client_addr.lock().await;
-            if let Some(addr) = *client {
-                if addr != default_send_addr {
-                    if let Err(e) = send_socket.send_to(&bytes, addr).await {
-                        debug!("Failed to send OSC to client {addr}: {e}");
+            // Also send to the last-known client IP (on the configured port)
+            // if it's different from the default address
+            let client_ip = *send_client_ip.lock().await;
+            if let Some(ip) = client_ip {
+                let client_addr = SocketAddr::new(ip, send_port);
+                if client_addr != default_send_addr {
+                    if let Err(e) = send_socket.send_to(&bytes, client_addr).await {
+                        debug!("Failed to send OSC to client {client_addr}: {e}");
                     }
                 }
             }
@@ -71,27 +75,38 @@ pub async fn run(
     // Inbound listener loop
     let mut buf = [0u8; 4096];
     loop {
-        let (len, src_addr) = match socket.recv_from(&mut buf).await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("OSC recv error: {e}");
-                continue;
+        tokio::select! {
+            result = socket.recv_from(&mut buf) => {
+                let (len, src_addr) = match result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("OSC recv error: {e}");
+                        continue;
+                    }
+                };
+
+                // Remember the client's IP (not port — responses use the configured send port)
+                *last_client_ip.lock().await = Some(src_addr.ip());
+
+                let packet = match rosc::decoder::decode_udp(&buf[..len]) {
+                    Ok((_rest, packet)) => packet,
+                    Err(e) => {
+                        warn!("Failed to decode OSC from {src_addr}: {e}");
+                        continue;
+                    }
+                };
+
+                handle_packet(&packet, &cmd_tx).await;
             }
-        };
-
-        // Remember who sent us a message
-        *last_client_addr.lock().await = Some(src_addr);
-
-        let packet = match rosc::decoder::decode_udp(&buf[..len]) {
-            Ok((_rest, packet)) => packet,
-            Err(e) => {
-                warn!("Failed to decode OSC from {src_addr}: {e}");
-                continue;
+            _ = &mut sender_handle => {
+                // Sender task exited (resp_rx channel closed), we should exit too
+                info!("OSC sender task ended");
+                break;
             }
-        };
-
-        handle_packet(&packet, &cmd_tx).await;
+        }
     }
+
+    Ok(())
 }
 
 /// Recursively handle an OSC packet (message or bundle).

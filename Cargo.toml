@@ -13,13 +13,12 @@ muda = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 tracing-appender = "0.2"
-image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
 futures-util = "0.3"
 open = "5"
 
 # Hide console window on Windows release builds
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["wincon", "winuser"] }
+winapi = { version = "0.3", features = ["winuser"] }

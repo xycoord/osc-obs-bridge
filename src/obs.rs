@@ -175,16 +175,20 @@ async fn handle_command(
         }
 
         BridgeCommand::GetActiveScene => {
-            let current = client.scenes().current_program_scene().await?;
-            let (index, _names) = get_scene_index(client, &current.id.name).await?;
-            info!(
-                "Active scene requested: {} (index {})",
-                current.id.name, index
-            );
+            // Use a single list() call which includes the current scene,
+            // avoiding a race between separate list + current_program_scene calls.
+            let scenes = client.scenes().list().await?;
+            let names: Vec<String> = scenes.scenes.iter().map(|s| s.id.name.clone()).collect();
+            let current_name = scenes
+                .current_program_scene
+                .map(|id| id.name)
+                .unwrap_or_default();
+            let index = names.iter().position(|n| n == &current_name).unwrap_or(0);
+            info!("Active scene requested: {current_name} (index {index})");
             resp_tx
                 .send(BridgeResponse::ActiveScene {
                     index,
-                    name: current.id.name,
+                    name: current_name,
                 })
                 .await?;
         }
@@ -205,7 +209,12 @@ async fn handle_command(
             let scenes = client.scenes().list().await?;
             let names: Vec<String> = scenes.scenes.iter().map(|s| s.id.name.clone()).collect();
             // OSC index is 1-based
-            let zero_idx = (idx - 1).max(0) as usize;
+            if idx < 1 {
+                warn!("Invalid scene index {idx} (must be >= 1)");
+                resp_tx.send(BridgeResponse::SceneList(names)).await?;
+                return Ok(());
+            }
+            let zero_idx = (idx - 1) as usize;
             if let Some(name) = names.get(zero_idx) {
                 info!("Switching to scene by index {idx}: {name}");
                 client
