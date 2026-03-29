@@ -3,6 +3,7 @@ name = "osc-obs-bridge"
 version = "0.1.0"
 edition = "2021"
 description = "Lightweight OSC to OBS WebSocket bridge for TouchOSC scene switching"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
