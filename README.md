@@ -20,38 +20,51 @@ Download `osc-obs-bridge.exe` from the [latest release](https://github.com/xycoo
 Run the exe. Three things happen:
 - **Windows Firewall** will ask to allow network access — click **Allow**. The bridge needs this to receive OSC messages from your tablet.
 - A `config.json` file is created next to the exe with default settings
-- A dot ⚪ appears in your system tray (bottom-right of the taskbar — you may need to click the `^` arrow to see it)
+- A red dot 🔴 appears in your system tray (bottom-right of the taskbar — you may need to click the `^` arrow to see it)
 
 ### 3. Configure
 
-Right-click the tray dot and choose **Open Config**. This opens `config.json` in your text editor. You need to change two things:
+Right-click the tray dot and choose **Open Config**. This opens `config.json` in your text editor. You only need to change one thing:
 
 **Your OBS WebSocket password** — find this in OBS under Tools > WebSocket Server Settings. Copy the password and put it in the config:
 ```json
 "obs_password": "your-password-here"
 ```
 
-**Your machine's IP** — run `ipconfig` in a command prompt and find your local IP (e.g. `192.168.1.50`):
-```json
-"osc_listen_host": "192.168.1.50"
-```
+Everything else should work automatically:
+- **`osc_listen_host`** defaults to `"auto"` which detects your machine's local network IP
+- **`osc_send_host`** defaults to `"broadcast"` which sends responses to all devices on your network
+- **Ports** default to TouchOSC's defaults (9000/8000)
 
-The bridge will automatically broadcast responses to all devices on your network (it derives the broadcast address from your IP — e.g. `192.168.1.50` becomes `192.168.1.255`).
+> **Tip:** If auto-detection picks the wrong network interface (e.g. you have multiple NICs), check the log file to see which IP was detected, then set `osc_listen_host` to the correct IP manually. If you'd rather target a single tablet, set `osc_send_host` to the tablet's IP instead of `"broadcast"`.
 
-> **Tip:** If you'd rather target a single tablet, set `osc_send_host` to the tablet's IP (find it in the tablet's Wi-Fi settings) instead of the default `"broadcast"`.
-
-⚠️ The machine running the bridge should have a **static IP** (set in Windows network settings or reserved in your router's DHCP settings). If the IP changes, both `osc_listen_host` and your TouchOSC connection will stop working.
+⚠️ The machine running the bridge should have a **static IP** (set in Windows network settings or reserved in your router's DHCP settings). If the IP changes, your TouchOSC connection will stop working.
 
 ⚠️ The default ports (9000/8000) match TouchOSC's defaults. If you've changed them in TouchOSC, update the config to match. 
 
 ### 4. Reload
 
-Save the config file, then right-click the tray dot and choose **Reload Config**. 
+Save the config file, then right-click the tray dot and choose **Reload Config**.
 If everything is set up correctly, the dot turns green 🟢.
 
-### 5. Start on Boot (optional)
+### 5. Set Up TouchOSC
 
-Press `Win+R`, type `shell:startup`, and put a shortcut to the exe in that folder.
+In TouchOSC, open the connection settings 🔗 and go to the OSC tab. Set up a new connection or update an old one:
+
+1. **Host**: Tap **Browse** — the bridge should appear as `osc-obs-bridge`. Selecting it auto-fills the host and send port. If it doesn't appear, enter the bridge machine's IP manually.
+2. **Send Port**: Must match `osc_listen_port` in the bridge config (default 9000)
+3. **Receive Port**: Must match `osc_send_port` in the bridge config (default 8000)
+4. Make sure the connection is **enabled**
+
+If your layout uses a specific connection number (e.g. Connection 1), make sure the OSC messages in your layout are configured to send/receive on that same connection.
+
+### 6. Start on Boot (optional)
+
+1. Right-click `osc-obs-bridge.exe` and select **Create shortcut**
+2. Press `Win+R`, type `shell:startup`, and press Enter — this opens your Startup folder
+3. Move the shortcut into that folder
+
+The bridge will now start automatically when you log in.
 
 ## System Tray
 
@@ -60,8 +73,8 @@ The tray dot shows connection status at a glance:
 | Icon | Meaning |
 |---|---|
 | 🟢 | Connected to OBS |
-| ⚪ | Starting up, or OBS is disconnected (auto-reconnects every 5s) |
-| 🔴 | Error |
+| ⚪ | Starting up, or waiting for OBS (auto-reconnects every 5s) |
+| 🔴 | Error — right-click to see details (e.g. password not set, password incorrect) |
 
 Right-click menu:
 - **Status line** — current state and active scene name
@@ -77,7 +90,7 @@ Right-click menu:
 | `obs_host` | IP of the machine running OBS. Leave as `127.0.0.1` if OBS runs on the same machine as the bridge |
 | `obs_port` | Must match the port in OBS > Tools > WebSocket Server Settings (default 4455) |
 | `obs_password` | **Must change.** Copy from OBS > Tools > WebSocket Server Settings |
-| `osc_listen_host` | **Must change.** The bridge machine's local IP (e.g. `192.168.1.50`) |
+| `osc_listen_host` | Default `"auto"` — detects local IP. Set manually if you have multiple network interfaces |
 | `osc_listen_port` | Must match TouchOSC's **send port** (default 9000) |
 | `osc_send_host` | Default `"broadcast"` — auto-derives from `osc_listen_host`. Or set a specific tablet's IP |
 | `osc_send_port` | Must match TouchOSC's **receive port** (default 8000) |
@@ -85,20 +98,38 @@ Right-click menu:
 
 ## Troubleshooting
 
-**Tray dot stays grey**
+### Tray dot is red 🔴
+- Right-click the tray dot to see the error message in the status line
+- "password not set" — set `obs_password` in config.json, then Reload Config
+- "password incorrect" — check the password matches OBS > Tools > WebSocket Server Settings exactly (case-sensitive)
+
+### Tray dot stays grey ⚪ (waiting for OBS)
 - Is OBS running with the WebSocket server enabled? (Tools > WebSocket Server Settings)
-- Does `obs_password` in your config match exactly? (case-sensitive)
 - If OBS is on a different machine, check that `obs_host` is set to that machine's IP and its firewall allows TCP on the WebSocket port
 
-**TouchOSC doesn't receive responses**
-- Is `osc_send_host` set to your tablet's IP? (not `127.0.0.1`)
+### Bridge isn't receiving OSC messages (log shows no incoming messages)
+- **Windows Firewall** may be blocking it. On first run, Windows asks to allow network access — if you clicked Cancel or Block, the bridge will be silently blocked. To fix:
+  1. Open **Windows Defender Firewall with Advanced Security** (search for it in the Start menu)
+  2. Click **Inbound Rules** on the left
+  3. Find any `osc-obs-bridge.exe` rules with **Block** in the Action column
+  4. Right-click and **Delete** those Block rules
+  5. Restart the bridge — it will prompt again, click **Allow**
+- Check that TouchOSC's **send port** matches `osc_listen_port` in the bridge config
+
+### TouchOSC doesn't receive responses
+- Is `osc_send_host` set to `"broadcast"` or your tablet's IP? (not `127.0.0.1`)
 - Do `osc_listen_port` and `osc_send_port` match the ports in your TouchOSC connection settings? (note: TouchOSC's "send port" is the bridge's "listen port" and vice versa)
 - Are the tablet and bridge machine on the same network?
 
-**Scene list doesn't update after changes in OBS**
+### TouchOSC doesn't show the bridge in Browse**
+- The bridge advertises itself via mDNS/Zeroconf. This may take a few seconds to appear.
+- Make sure the bridge is running and the tray dot is visible
+- If it still doesn't appear, enter the bridge IP and port manually in TouchOSC
+
+### Scene list doesn't update after changes in OBS
 - The bridge auto-detects scene changes via OBS events and polls every 1 second for reordering. If it's not updating, check the log file for errors
 
-**Config changes not taking effect**
+### Config changes not taking effect
 - Use **Reload Config** from the tray menu — editing the file alone doesn't apply changes
 - Check the log file for config parse errors (missing comma, trailing comma, etc.)
 

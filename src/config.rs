@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// OBS WebSocket password — must be set by the user
+    #[serde(default)]
+    pub obs_password: String,
+
     /// OBS WebSocket host (default: 127.0.0.1)
     #[serde(default = "default_localhost")]
     pub obs_host: String,
@@ -12,11 +16,7 @@ pub struct Config {
     #[serde(default = "default_obs_port")]
     pub obs_port: u16,
 
-    /// OBS WebSocket password (default: "secret")
-    #[serde(default = "default_obs_password")]
-    pub obs_password: String,
-
-    /// OSC listen host (default: 0.0.0.0 to accept from network)
+    /// OSC listen host (default: "auto" — detects the machine's local network IP)
     #[serde(default = "default_osc_listen_host")]
     pub osc_listen_host: String,
 
@@ -43,11 +43,8 @@ fn default_localhost() -> String {
 fn default_obs_port() -> u16 {
     4455
 }
-fn default_obs_password() -> String {
-    "secret".to_string()
-}
 fn default_osc_listen_host() -> String {
-    "0.0.0.0".to_string()
+    "auto".to_string()
 }
 fn default_osc_listen_port() -> u16 {
     9000
@@ -65,10 +62,10 @@ fn default_log_file() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            obs_password: String::new(),
             obs_host: default_localhost(),
             obs_port: default_obs_port(),
-            obs_password: default_obs_password(),
-            osc_listen_host: default_osc_listen_host(),
+            osc_listen_host: default_osc_listen_host(), // "auto"
             osc_listen_port: default_osc_listen_port(),
             osc_send_host: default_osc_send_host(),
             osc_send_port: default_osc_send_port(),
@@ -98,16 +95,36 @@ impl Config {
         }
     }
 
-    /// Resolve the OSC send host. If set to "broadcast", derives the broadcast
-    /// address from `osc_listen_host` by replacing the last octet with 255.
-    pub fn resolved_osc_send_host(&self) -> String {
-        if self.osc_send_host.eq_ignore_ascii_case("broadcast") {
-            match self.osc_listen_host.rfind('.') {
-                Some(pos) => format!("{}.255", &self.osc_listen_host[..pos]),
+    /// Resolve the OSC listen host. If set to "auto", detects the machine's
+    /// first non-loopback IPv4 address. Falls back to 127.0.0.1 if detection fails.
+    pub fn resolved_osc_listen_host(&self) -> String {
+        if self.osc_listen_host.eq_ignore_ascii_case("auto") {
+            match detect_local_ip() {
+                Some(ip) => {
+                    tracing::info!("Auto-detected local IP: {ip}");
+                    ip
+                }
                 None => {
                     tracing::warn!(
-                        "Cannot derive broadcast from '{}', falling back to 255.255.255.255",
-                        self.osc_listen_host
+                        "Could not auto-detect local IP, falling back to 127.0.0.1"
+                    );
+                    "127.0.0.1".to_string()
+                }
+            }
+        } else {
+            self.osc_listen_host.clone()
+        }
+    }
+
+    /// Resolve the OSC send host. If set to "broadcast", derives the broadcast
+    /// address from the resolved listen host by replacing the last octet with 255.
+    pub fn resolved_osc_send_host(&self, resolved_listen_host: &str) -> String {
+        if self.osc_send_host.eq_ignore_ascii_case("broadcast") {
+            match resolved_listen_host.rfind('.') {
+                Some(pos) => format!("{}.255", &resolved_listen_host[..pos]),
+                None => {
+                    tracing::warn!(
+                        "Cannot derive broadcast from '{resolved_listen_host}', falling back to 255.255.255.255"
                     );
                     "255.255.255.255".to_string()
                 }
@@ -124,4 +141,15 @@ impl Config {
             .and_then(|p| p.parent().map(|d| d.join("config.json")))
             .unwrap_or_else(|| PathBuf::from("config.json"))
     }
+}
+
+/// Detect the machine's first non-loopback IPv4 address.
+fn detect_local_ip() -> Option<String> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .find(|iface| {
+            !iface.is_loopback() && iface.addr.ip().is_ipv4()
+        })
+        .map(|iface| iface.addr.ip().to_string())
 }

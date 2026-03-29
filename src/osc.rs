@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use rosc::{OscMessage, OscPacket, OscType};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -20,7 +21,8 @@ pub async fn run(
     mut resp_rx: mpsc::Receiver<BridgeResponse>,
     status_tx: watch::Sender<AppStatus>,
 ) -> Result<()> {
-    let listen_addr = format!("{}:{}", config.osc_listen_host, config.osc_listen_port);
+    let resolved_listen_host = config.resolved_osc_listen_host();
+    let listen_addr = format!("{resolved_listen_host}:{}", config.osc_listen_port);
     let socket = UdpSocket::bind(&listen_addr)
         .await
         .with_context(|| format!("Failed to bind OSC socket on {listen_addr}"))?;
@@ -29,16 +31,27 @@ pub async fn run(
     socket.set_broadcast(true)?;
 
     info!("OSC listening on {listen_addr}");
-    let _ = status_tx.send(AppStatus::OscListening);
+    // Only set OscListening if no error status has already been set by the OBS task
+    status_tx.send_if_modified(|current| {
+        if matches!(current, AppStatus::Starting) {
+            *current = AppStatus::OscListening;
+            true
+        } else {
+            false
+        }
+    });
 
     let socket = Arc::new(socket);
     let send_port = config.osc_send_port;
-    let resolved_send_host = config.resolved_osc_send_host();
+    let resolved_send_host = config.resolved_osc_send_host(&resolved_listen_host);
     let default_send_addr: SocketAddr = format!("{resolved_send_host}:{send_port}")
         .parse()
         .with_context(|| format!("Invalid OSC send address: {resolved_send_host}:{send_port}"))?;
 
     info!("OSC sending to {default_send_addr}");
+
+    // Advertise the OSC service via mDNS/Zeroconf so TouchOSC can discover it
+    let _mdns = register_mdns_service(&resolved_listen_host, config.osc_listen_port);
 
     // Track the last client IP we received a message from.
     // This lets us reply to the tablet even if its IP differs from the configured send address.
@@ -184,4 +197,48 @@ fn response_to_osc(response: &BridgeResponse) -> OscPacket {
             ],
         }),
     }
+}
+
+/// Register an mDNS service so TouchOSC can discover this bridge via its "Browse" button.
+/// Returns the ServiceDaemon (must be kept alive for the advertisement to persist).
+fn register_mdns_service(host: &str, port: u16) -> Option<ServiceDaemon> {
+    let mdns = match ServiceDaemon::new() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("Failed to start mDNS daemon: {e}");
+            return None;
+        }
+    };
+
+    let service_type = "_osc._udp.local.";
+    let instance_name = "osc-obs-bridge";
+    let host_fqdn = format!("{host}.local.");
+
+    let properties: &[(&str, &str)] = &[];
+    let service_info = match ServiceInfo::new(
+        service_type,
+        instance_name,
+        &host_fqdn,
+        host,
+        port,
+        properties,
+    ) {
+        Ok(info) => info,
+        Err(e) => {
+            warn!("Failed to create mDNS service info: {e}");
+            return None;
+        }
+    };
+
+    match mdns.register(service_info) {
+        Ok(_) => {
+            info!("mDNS: advertising as '{instance_name}' on {host}:{port} (_osc._udp)");
+        }
+        Err(e) => {
+            warn!("Failed to register mDNS service: {e}");
+            return None;
+        }
+    }
+
+    Some(mdns)
 }

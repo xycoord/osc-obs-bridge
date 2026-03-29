@@ -16,6 +16,17 @@ pub async fn run(
     resp_tx: mpsc::Sender<BridgeResponse>,
     status_tx: watch::Sender<AppStatus>,
 ) {
+    // Check for empty password before attempting connection
+    if config.obs_password.is_empty() {
+        error!("OBS password is empty. Set obs_password in config.json and reload.");
+        let _ = status_tx.send(AppStatus::Error(
+            "OBS password not set — edit config.json and Reload Config".to_string(),
+        ));
+        // Park until the task is aborted by a reload
+        std::future::pending::<()>().await;
+        return;
+    }
+
     loop {
         info!(
             "Connecting to OBS at {}:{}...",
@@ -27,6 +38,16 @@ pub async fn run(
                 info!("OBS connection closed cleanly");
             }
             Err(e) => {
+                let err_str = format!("{e:?}").to_lowercase();
+                if err_str.contains("auth") || err_str.contains("password") || err_str.contains("identified") {
+                    error!("OBS authentication failed — check obs_password in config.json");
+                    let _ = status_tx.send(AppStatus::Error(
+                        "OBS password incorrect — edit config.json and Reload Config".to_string(),
+                    ));
+                    // Park until the task is aborted by a reload
+                    std::future::pending::<()>().await;
+                    return;
+                }
                 warn!("OBS connection error: {e}");
             }
         }
