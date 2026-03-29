@@ -143,6 +143,10 @@ async fn connect_and_run(
                         info!("OBS scene renamed: {old_name} -> {new_name}");
                         push_scene_list(&client, resp_tx).await;
                     }
+                    Some(obws::events::Event::SceneListChanged { .. }) => {
+                        info!("OBS scene list reordered");
+                        push_scene_list(&client, resp_tx).await;
+                    }
                     Some(_) => {
                         // Ignore other events
                     }
