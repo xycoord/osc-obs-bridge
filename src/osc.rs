@@ -25,14 +25,20 @@ pub async fn run(
         .await
         .with_context(|| format!("Failed to bind OSC socket on {listen_addr}"))?;
 
+    // Enable broadcast so we can send to x.x.x.255 addresses
+    socket.set_broadcast(true)?;
+
     info!("OSC listening on {listen_addr}");
     let _ = status_tx.send(AppStatus::OscListening);
 
     let socket = Arc::new(socket);
     let send_port = config.osc_send_port;
-    let default_send_addr: SocketAddr = format!("{}:{}", config.osc_send_host, send_port)
+    let resolved_send_host = config.resolved_osc_send_host();
+    let default_send_addr: SocketAddr = format!("{resolved_send_host}:{send_port}")
         .parse()
-        .context("Invalid OSC send address")?;
+        .with_context(|| format!("Invalid OSC send address: {resolved_send_host}:{send_port}"))?;
+
+    info!("OSC sending to {default_send_addr}");
 
     // Track the last client IP we received a message from.
     // This lets us reply to the tablet even if its IP differs from the configured send address.

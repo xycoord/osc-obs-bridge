@@ -24,8 +24,8 @@ pub struct Config {
     #[serde(default = "default_osc_listen_port")]
     pub osc_listen_port: u16,
 
-    /// OSC send host for responses (default: 127.0.0.1)
-    #[serde(default = "default_localhost")]
+    /// OSC send host for responses (default: "broadcast" — derives broadcast address from osc_listen_host)
+    #[serde(default = "default_osc_send_host")]
     pub osc_send_host: String,
 
     /// OSC send port for responses (default: 53000)
@@ -50,10 +50,13 @@ fn default_osc_listen_host() -> String {
     "0.0.0.0".to_string()
 }
 fn default_osc_listen_port() -> u16 {
-    3333
+    9000
+}
+fn default_osc_send_host() -> String {
+    "broadcast".to_string()
 }
 fn default_osc_send_port() -> u16 {
-    53000
+    8000
 }
 fn default_log_file() -> String {
     "osc-obs-bridge.log".to_string()
@@ -67,7 +70,7 @@ impl Default for Config {
             obs_password: default_obs_password(),
             osc_listen_host: default_osc_listen_host(),
             osc_listen_port: default_osc_listen_port(),
-            osc_send_host: default_localhost(),
+            osc_send_host: default_osc_send_host(),
             osc_send_port: default_osc_send_port(),
             log_file: default_log_file(),
         }
@@ -92,6 +95,25 @@ impl Config {
             }
             std::fs::write(path, contents).context("Failed to write default config file")?;
             Ok(config)
+        }
+    }
+
+    /// Resolve the OSC send host. If set to "broadcast", derives the broadcast
+    /// address from `osc_listen_host` by replacing the last octet with 255.
+    pub fn resolved_osc_send_host(&self) -> String {
+        if self.osc_send_host.eq_ignore_ascii_case("broadcast") {
+            match self.osc_listen_host.rfind('.') {
+                Some(pos) => format!("{}.255", &self.osc_listen_host[..pos]),
+                None => {
+                    tracing::warn!(
+                        "Cannot derive broadcast from '{}', falling back to 255.255.255.255",
+                        self.osc_listen_host
+                    );
+                    "255.255.255.255".to_string()
+                }
+            }
+        } else {
+            self.osc_send_host.clone()
         }
     }
 

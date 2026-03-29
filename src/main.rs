@@ -241,14 +241,20 @@ async fn run_bridge_loop(
 }
 
 fn log_config(config: &config::Config) {
+    let send_host = config.resolved_osc_send_host();
     info!(
-        "OBS: {}:{} | OSC listen: {}:{} | OSC send: {}:{}",
+        "OBS: {}:{} | OSC listen: {}:{} | OSC send: {}:{}{}",
         config.obs_host,
         config.obs_port,
         config.osc_listen_host,
         config.osc_listen_port,
-        config.osc_send_host,
+        send_host,
         config.osc_send_port,
+        if config.osc_send_host.eq_ignore_ascii_case("broadcast") {
+            " (broadcast)"
+        } else {
+            ""
+        },
     );
 }
 
