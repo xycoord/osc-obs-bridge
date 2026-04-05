@@ -58,33 +58,77 @@ pub async fn run(
     // We store only the IP — responses are always sent to the configured osc_send_port.
     let last_client_ip: Arc<Mutex<Option<std::net::IpAddr>>> = Arc::new(Mutex::new(None));
 
-    // Spawn the outbound sender task
+    // Spawn the outbound sender task.
+    // Sends both BridgeResponse messages and auto-pushes /bridgeStatus on status changes.
     let send_socket = Arc::clone(&socket);
     let send_client_ip = Arc::clone(&last_client_ip);
+    let mut status_rx = status_tx.subscribe();
     let mut sender_handle = tokio::spawn(async move {
-        while let Some(response) = resp_rx.recv().await {
-            let packet = response_to_osc(&response);
-            let bytes = match rosc::encoder::encode(&packet) {
-                Ok(b) => b,
-                Err(e) => {
-                    error!("Failed to encode OSC response: {e}");
-                    continue;
-                }
-            };
+        // Heartbeat: send /bridgeStatus every 2 seconds so clients can detect disconnection
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-            // Send to the configured default address
-            if let Err(e) = send_socket.send_to(&bytes, default_send_addr).await {
-                error!("Failed to send OSC to {default_send_addr}: {e}");
+        /// Encode and send an OSC packet to all known clients.
+        async fn send_to_clients(
+            bytes: &[u8],
+            socket: &UdpSocket,
+            default_addr: SocketAddr,
+            client_ip: &Mutex<Option<std::net::IpAddr>>,
+            port: u16,
+        ) {
+            if let Err(e) = socket.send_to(bytes, default_addr).await {
+                error!("Failed to send OSC to {default_addr}: {e}");
             }
-
-            // Also send to the last-known client IP (on the configured port)
-            // if it's different from the default address
-            let client_ip = *send_client_ip.lock().await;
-            if let Some(ip) = client_ip {
-                let client_addr = SocketAddr::new(ip, send_port);
-                if client_addr != default_send_addr {
-                    if let Err(e) = send_socket.send_to(&bytes, client_addr).await {
+            let ip = *client_ip.lock().await;
+            if let Some(ip) = ip {
+                let client_addr = SocketAddr::new(ip, port);
+                if client_addr != default_addr {
+                    if let Err(e) = socket.send_to(bytes, client_addr).await {
                         debug!("Failed to send OSC to client {client_addr}: {e}");
+                    }
+                }
+            }
+        }
+
+        loop {
+            tokio::select! {
+                resp = resp_rx.recv() => {
+                    match resp {
+                        Some(response) => {
+                            let packet = response_to_osc(&response);
+                            match rosc::encoder::encode(&packet) {
+                                Ok(bytes) => {
+                                    send_to_clients(&bytes, &send_socket, default_send_addr, &send_client_ip, send_port).await;
+                                }
+                                Err(e) => error!("Failed to encode OSC response: {e}"),
+                            }
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+                _ = status_rx.changed() => {
+                    // Status changed — push /bridgeStatus to clients
+                    let status_str = status_rx.borrow_and_update().osc_status().to_string();
+                    let packet = OscPacket::Message(OscMessage {
+                        addr: "/bridgeStatus".to_string(),
+                        args: vec![OscType::String(status_str)],
+                    });
+                    match rosc::encoder::encode(&packet) {
+                        Ok(bytes) => {
+                            send_to_clients(&bytes, &send_socket, default_send_addr, &send_client_ip, send_port).await;
+                        }
+                        Err(e) => error!("Failed to encode bridgeStatus: {e}"),
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    // Periodic heartbeat so clients can detect if the bridge dies
+                    let status_str = status_rx.borrow().osc_status().to_string();
+                    let packet = OscPacket::Message(OscMessage {
+                        addr: "/bridgeStatus".to_string(),
+                        args: vec![OscType::String(status_str)],
+                    });
+                    if let Ok(bytes) = rosc::encoder::encode(&packet) {
+                        send_to_clients(&bytes, &send_socket, default_send_addr, &send_client_ip, send_port).await;
                     }
                 }
             }
@@ -114,6 +158,26 @@ pub async fn run(
                         continue;
                     }
                 };
+
+                // Handle /bridgeStatus directly (not forwarded to OBS task)
+                if is_bridge_status_request(&packet) {
+                    let status_str = status_tx.borrow().osc_status().to_string();
+                    debug!("Bridge status requested, responding: {status_str}");
+                    let resp = OscPacket::Message(OscMessage {
+                        addr: "/bridgeStatus".to_string(),
+                        args: vec![OscType::String(status_str)],
+                    });
+                    if let Ok(bytes) = rosc::encoder::encode(&resp) {
+                        let _ = socket.send_to(&bytes, default_send_addr).await;
+                        // Also reply to the specific client
+                        if let Some(ip) = *last_client_ip.lock().await {
+                            let client_addr = SocketAddr::new(ip, send_port);
+                            if client_addr != default_send_addr {
+                                let _ = socket.send_to(&bytes, client_addr).await;
+                            }
+                        }
+                    }
+                }
 
                 handle_packet(&packet, &cmd_tx).await;
             }
@@ -179,6 +243,14 @@ fn parse_scene_command(args: &[OscType]) -> Option<BridgeCommand> {
     }
 }
 
+/// Check if an OSC packet contains a `/bridgeStatus` request.
+fn is_bridge_status_request(packet: &OscPacket) -> bool {
+    match packet {
+        OscPacket::Message(msg) => msg.addr == "/bridgeStatus",
+        OscPacket::Bundle(bundle) => bundle.content.iter().any(is_bridge_status_request),
+    }
+}
+
 /// Convert a BridgeResponse into an OSC packet for sending.
 fn response_to_osc(response: &BridgeResponse) -> OscPacket {
     match response {
@@ -195,6 +267,10 @@ fn response_to_osc(response: &BridgeResponse) -> OscPacket {
                 OscType::Int(*index as i32),
                 OscType::String(name.clone()),
             ],
+        }),
+        BridgeResponse::Status(status) => OscPacket::Message(OscMessage {
+            addr: "/bridgeStatus".to_string(),
+            args: vec![OscType::String(status.clone())],
         }),
     }
 }

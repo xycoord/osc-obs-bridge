@@ -20,6 +20,8 @@ pub enum BridgeResponse {
     SceneList(Vec<String>),
     /// Currently active scene: 0-based index and name.
     ActiveScene { index: usize, name: String },
+    /// Bridge status string for diagnostics.
+    Status(String),
 }
 
 /// Application status, watched by the tray icon.
@@ -30,6 +32,21 @@ pub enum AppStatus {
     ObsDisconnected,
     Connected { scene: String },
     Error(String),
+}
+
+impl AppStatus {
+    /// Convert to a short status string for the `/bridgeStatus` OSC message.
+    pub fn osc_status(&self) -> &str {
+        match self {
+            AppStatus::Starting => "starting",
+            AppStatus::OscListening => "obs_disconnected",
+            AppStatus::ObsDisconnected => "obs_disconnected",
+            AppStatus::Connected { .. } => "connected",
+            AppStatus::Error(e) if e.contains("password not set") => "obs_password_not_set",
+            AppStatus::Error(e) if e.contains("password incorrect") => "obs_password_incorrect",
+            AppStatus::Error(_) => "error",
+        }
+    }
 }
 
 impl std::fmt::Display for AppStatus {
